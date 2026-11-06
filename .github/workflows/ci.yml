@@ -14,7 +14,12 @@ jobs:
       - name: Install Swift 6.4
         run: bash scripts/install-swift-linux.sh
       - name: Test
-        run: bash -lc '. "$HOME/.local/share/swiftly/env.sh" && make test'
+        run: |
+          if [[ -f "$HOME/.local/share/swiftly/env.sh" ]]; then
+            # shellcheck disable=SC1091
+            . "$HOME/.local/share/swiftly/env.sh"
+          fi
+          make test
 
   macos-app:
     name: macOS build, test, and codesign
