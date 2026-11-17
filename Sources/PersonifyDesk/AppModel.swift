@@ -405,16 +405,29 @@ final class AppModel {
         connectedDeviceID = id
         devices[id]?.link = .connected
         clearRoomError()
-        statusLine = "Connected to \(deviceName(id)). Reading every readable characteristic."
+        blindWatchGeneration += 1
+        blindWatch = .idle
+        statusLine = "Connected to \(deviceName(id))."
         log(kind: "connected", deviceID: id.uuidString, message: statusLine)
-        beginBlindGroupRead()
+    }
+
+    /// The 00020003 read has been submitted. The timer starts here, not at connect,
+    /// because the characteristic does not exist until its service is discovered.
+    func armBlindGroupWatch() {
+        blindWatchGeneration += 1
+        blindWatch = .awaitingFirst
+        scheduleBlindWatch(generation: blindWatchGeneration)
+    }
+
+    func noteBlindGroupsMissing() {
+        guard blindWatch != .ready else { return }
+        blindWatchGeneration += 1
+        blindWatch = .failed
     }
 
     func beginBlindGroupRead() {
-        blindWatchGeneration += 1
-        blindWatch = .awaitingFirst
+        armBlindGroupWatch()
         session.readBlindGroups()
-        scheduleBlindWatch(generation: blindWatchGeneration)
     }
 
     func retryBlindGroups() {
@@ -806,6 +819,9 @@ final class AppModel {
     func chooseRoom(_ id: UUID) {
         guard let device = devices[id] else { return }
         declinedPINPromptFor = nil
+        if openedRoomID != id {
+            blindTarget = 0
+        }
         roomList.select(id.uuidString, name: device.displayName)
         saveRoomList()
         if !demoMode {

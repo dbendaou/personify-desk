@@ -13,6 +13,14 @@ final class BluetoothSession: NSObject {
     private var bridge: PDSPairingBridge?
     private var lastDisconnect: (UUID, TimeInterval, String)?
     private var readBatch: ReadBatch?
+    /// Services still waiting for characteristic discovery, most useful first.
+    private var serviceOrder: [String] = []
+    private var inflightServiceUUID: String?
+    private var deferredReads: [String] = []
+    private var deferredDescriptors: [String] = []
+    private var bulkInFlight: String?
+    private var descriptorsStarted = false
+    private var blindReadArmed = false
     private var queuedFrames: [Data] = []
     private var queuedFrameID: String?
     private var queuedSpacingMilliseconds = 0
@@ -315,6 +323,13 @@ final class BluetoothSession: NSObject {
     fileprivate func resetLink() {
         characteristics.removeAll()
         idByObject.removeAll()
+        serviceOrder = []
+        inflightServiceUUID = nil
+        deferredReads = []
+        deferredDescriptors = []
+        bulkInFlight = nil
+        descriptorsStarted = false
+        blindReadArmed = false
         bridge?.stop()
         bridge = nil
     }
@@ -565,13 +580,13 @@ extension BluetoothSession: CBPeripheralDelegate {
             for service in peripheral.services ?? [] {
                 let node = GATTServiceNode(id: service.uuid.uuidString, uuid: service.uuid.uuidString, characteristics: [])
                 self.model?.services.append(node)
-                peripheral.discoverCharacteristics(nil, for: service)
             }
             self.model?.log(
                 kind: "services",
                 deviceID: peripheral.identifier.uuidString,
                 message: "Discovered \(peripheral.services?.count ?? 0) services."
             )
+            self.beginExploration(of: peripheral)
         }
     }
 
@@ -585,28 +600,40 @@ extension BluetoothSession: CBPeripheralDelegate {
                 self.model?.statusLine = message
                 self.model?.log(kind: "error", deviceID: peripheral.identifier.uuidString, message: message)
             }
+            guard peripheral.identifier == self.model?.connectedDeviceID else { return }
             let serviceID = service.uuid.uuidString
             var nodes: [GATTCharNode] = []
+            var described: [ConnectionSetup.Characteristic] = []
             for (index, characteristic) in (service.characteristics ?? []).enumerated() {
                 let node = self.remember(characteristic, serviceUUID: serviceID, index: index)
                 nodes.append(node)
-                peripheral.discoverDescriptors(for: characteristic)
-                let short = PersonifyVendor.shortIdentifier(characteristic.uuid.uuidString)
-                if short == "00020001" || short == "00020002" || short == "00020003" {
-                    let mask = characteristic.properties
-                    if mask.contains(.notify) || mask.contains(.indicate) {
-                        peripheral.setNotifyValue(true, for: characteristic)
-                    }
-                }
-            }
-            self.enqueueReads(nodes.map(\.id), on: peripheral, label: "After discovery")
-            if nodes.contains(where: { PersonifyVendor.shortIdentifier($0.uuid) == "00020003" }) {
-                self.readBlindGroups()
+                let properties = characteristic.properties
+                described.append(ConnectionSetup.Characteristic(
+                    id: node.id,
+                    shortUUID: PersonifyVendor.shortIdentifier(characteristic.uuid.uuidString),
+                    readable: properties.contains(.read),
+                    notifies: properties.contains(.notify) || properties.contains(.indicate)
+                ))
             }
             if let model = self.model, let index = model.services.firstIndex(where: { $0.uuid == serviceID }) {
                 model.services[index].characteristics = nodes
-                model.flushDeferredWrite()
             }
+            guard self.inflightServiceUUID == serviceID else { return }
+            self.inflightServiceUUID = nil
+            let split = ConnectionSetup.onDiscovered(described)
+            self.issueLead(split.now, on: peripheral)
+            for operation in split.later {
+                switch operation {
+                case .read(let id):
+                    self.deferredReads.append(id)
+                case .discoverDescriptors(let id):
+                    self.deferredDescriptors.append(id)
+                case .discoverService, .notify:
+                    break
+                }
+            }
+            self.model?.flushDeferredWrite()
+            self.exploreNext(on: peripheral)
         }
     }
 
@@ -730,41 +757,123 @@ extension BluetoothSession: CBPeripheralDelegate {
         return PairingFlow.isAuthenticationFailure(domain: ns.domain, code: ns.code)
     }
 
-    private func enqueueReads(_ ids: [String], on peripheral: CBPeripheral, label: String) {
-        let readable = ids.compactMap { id -> (String, CBCharacteristic)? in
-            guard let characteristic = characteristics[id], characteristic.properties.contains(.read) else { return nil }
-            return (id, characteristic)
+    private func beginExploration(of peripheral: CBPeripheral) {
+        let services = peripheral.services ?? []
+        let order = ConnectionSetup.orderedServiceIndexes(
+            shortIDs: services.map { PersonifyVendor.shortIdentifier($0.uuid.uuidString) }
+        )
+        serviceOrder = order.map { services[$0].uuid.uuidString }
+        inflightServiceUUID = nil
+        deferredReads = []
+        deferredDescriptors = []
+        bulkInFlight = nil
+        descriptorsStarted = false
+        blindReadArmed = false
+        exploreNext(on: peripheral)
+    }
+
+    /// One service at a time. Live reads are submitted before the next service is
+    /// discovered, so a `0001xxxx` blob cannot sit ahead of fan and blinds.
+    private func exploreNext(on peripheral: CBPeripheral) {
+        guard model?.connectedDeviceID == peripheral.identifier else { return }
+        guard !serviceOrder.isEmpty else {
+            if !blindReadArmed {
+                model?.noteBlindGroupsMissing()
+            }
+            pumpBulk(on: peripheral)
+            return
         }
-        guard !readable.isEmpty else { return }
+        let next = serviceOrder.removeFirst()
+        guard let service = peripheral.services?.first(where: { $0.uuid.uuidString == next }) else {
+            exploreNext(on: peripheral)
+            return
+        }
+        inflightServiceUUID = next
+        peripheral.discoverCharacteristics(nil, for: service)
+    }
+
+    private func issueLead(_ operations: [ConnectionSetup.Operation], on peripheral: CBPeripheral) {
+        for operation in operations {
+            switch operation {
+            case .read(let id):
+                guard requestRead(id, on: peripheral, label: "After discovery") else { continue }
+                let short = PersonifyVendor.shortIdentifier(characteristics[id]?.uuid.uuidString ?? "")
+                if short == "00020003", !blindReadArmed {
+                    blindReadArmed = true
+                    model?.armBlindGroupWatch()
+                }
+            case .notify(let id):
+                if let characteristic = characteristics[id] {
+                    peripheral.setNotifyValue(true, for: characteristic)
+                }
+            case .discoverService, .discoverDescriptors:
+                break
+            }
+        }
+    }
+
+    /// Bulk reads go out one at a time so a fan or blind write is not stuck
+    /// behind the rest of the table. Descriptor discovery starts when they finish.
+    private func pumpBulk(on peripheral: CBPeripheral) {
+        guard model?.connectedDeviceID == peripheral.identifier, bulkInFlight == nil else { return }
+        while !deferredReads.isEmpty {
+            let id = deferredReads.removeFirst()
+            if requestRead(id, on: peripheral, label: "After discovery") {
+                bulkInFlight = id
+                return
+            }
+        }
+        startDescriptors(on: peripheral)
+    }
+
+    private func startDescriptors(on peripheral: CBPeripheral) {
+        guard !descriptorsStarted else { return }
+        descriptorsStarted = true
+        let ids = deferredDescriptors
+        deferredDescriptors = []
+        for id in ids {
+            if let characteristic = characteristics[id] {
+                peripheral.discoverDescriptors(for: characteristic)
+            }
+        }
+    }
+
+    @discardableResult
+    private func requestRead(_ id: String, on peripheral: CBPeripheral, label: String) -> Bool {
+        guard let characteristic = characteristics[id], characteristic.properties.contains(.read) else { return false }
         var batch = readBatch ?? ReadBatch(deviceID: peripheral.identifier, label: label, outstanding: [], values: [:])
-        if batch.deviceID != peripheral.identifier || batch.label != label {
+        if batch.deviceID != peripheral.identifier {
             batch = ReadBatch(deviceID: peripheral.identifier, label: label, outstanding: [], values: [:])
         }
-        for (id, characteristic) in readable {
-            batch.outstanding.insert(id)
-            peripheral.readValue(for: characteristic)
-            model?.log(
-                kind: "read-request",
-                deviceID: peripheral.identifier.uuidString,
-                message: "Read requested \(characteristic.uuid.uuidString) (\(label))."
-            )
-        }
+        batch.outstanding.insert(id)
         readBatch = batch
-        model?.statusLine = "\(label): reading \(batch.outstanding.count) characteristics."
+        peripheral.readValue(for: characteristic)
+        model?.log(
+            kind: "read-request",
+            deviceID: peripheral.identifier.uuidString,
+            message: "Read requested \(characteristic.uuid.uuidString) (\(label))."
+        )
+        return true
     }
 
     private func completeRead(id: String, uuid: String, data: Data?) {
-        guard var batch = readBatch, batch.outstanding.contains(id) else { return }
-        batch.outstanding.remove(id)
-        if let data {
-            batch.values[uuid] = data
+        let finishedBulk = bulkInFlight == id
+        if finishedBulk { bulkInFlight = nil }
+        if var batch = readBatch, batch.outstanding.contains(id) {
+            batch.outstanding.remove(id)
+            if let data {
+                batch.values[uuid] = data
+            }
+            if batch.outstanding.isEmpty {
+                let finished = batch
+                readBatch = nil
+                model?.sealSnapshot(deviceID: finished.deviceID, label: finished.label, values: finished.values)
+            } else {
+                readBatch = batch
+            }
         }
-        if batch.outstanding.isEmpty {
-            let finished = batch
-            readBatch = nil
-            model?.sealSnapshot(deviceID: finished.deviceID, label: finished.label, values: finished.values)
-        } else {
-            readBatch = batch
+        if finishedBulk, let id = model?.connectedDeviceID, let peripheral = peripherals[id] {
+            pumpBulk(on: peripheral)
         }
     }
 }
