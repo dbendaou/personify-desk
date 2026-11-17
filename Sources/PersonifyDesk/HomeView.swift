@@ -325,6 +325,7 @@ private struct FanTile: View {
                 }
         }
         .buttonStyle(.plain)
+        .disabled(!RoomActionGate.fanEnabled(settingKnown: setting != nil))
         .accessibilityLabel(value == .auto ? "Auto" : title)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
@@ -404,7 +405,14 @@ private struct BlindsCard: View {
     let roomID: UUID
 
     private var groups: [Int]? { model.controls(for: roomID).blindGroups }
+    private var chips: [Int] { BlindReadWatch.pickerGroups(groups) }
     private var closed: Double { model.displayedBlindPercent() }
+    private var motionEnabled: Bool {
+        RoomActionGate.blindMotionEnabled(
+            groupsKnown: groups != nil,
+            percentKnown: model.controls(for: roomID).allBlindsClosed != nil
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -414,14 +422,14 @@ private struct BlindsCard: View {
                 value: closed,
                 tint: Color(red: 0.22, green: 0.48, blue: 0.96),
                 label: String(format: "%.0f%% closed", closed),
-                enabled: true,
+                enabled: motionEnabled,
                 onChange: { model.setDisplayedBlindPercent($0) },
                 onCommit: { model.releaseBlindSlider() }
             )
-            if BlindReadWatch.showsGroupPicker(groups) {
+            if !chips.isEmpty {
                 HStack(spacing: 6) {
                     blindPill("All", target: 0)
-                    ForEach(groups ?? [], id: \.self) { number in
+                    ForEach(chips, id: \.self) { number in
                         blindPill("Group \(number)", target: number)
                     }
                 }
@@ -464,6 +472,7 @@ private struct BlindsCard: View {
                 .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
+        .disabled(!motionEnabled)
     }
 }
 

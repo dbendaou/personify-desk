@@ -128,7 +128,10 @@ public enum BlindReadWatch: Equatable, Sendable {
     /// The read did not arrive. The All control still works.
     case failed
 
-    public static let timeout: TimeInterval = 4
+    /// How long to wait after the 00020003 read is actually submitted.
+    /// The read is no longer parked behind the rest of the GATT table, so this
+    /// only covers a lost response. One automatic retry uses the same interval.
+    public static let timeout: TimeInterval = 2
 
     /// Groups written by All. Until a read names them, All sends group 1 only.
     public static func allWriteGroups(_ known: [Int]?) -> [Int] {
@@ -138,6 +141,13 @@ public enum BlindReadWatch: Equatable, Sendable {
 
     public static func showsGroupPicker(_ known: [Int]?) -> Bool {
         (known?.count ?? 0) > 1
+    }
+
+    /// Chips under the blind slider. An unknown list is not Group 1...8.
+    /// One reported group is moved directly and does not need a picker.
+    public static func pickerGroups(_ known: [Int]?) -> [Int] {
+        guard showsGroupPicker(known), let known else { return [] }
+        return known
     }
 
     /// A missing or failed read retries once, then stops. The controls stay usable either way.
@@ -150,4 +160,12 @@ public enum BlindReadWatch: Equatable, Sendable {
             return (.failed, false)
         }
     }
+}
+
+/// Fan and blind buttons do not wait for their read. A missing value updates the
+/// tile when it arrives; it does not leave the control disabled.
+public enum RoomActionGate {
+    public static func fanEnabled(settingKnown _: Bool) -> Bool { true }
+
+    public static func blindMotionEnabled(groupsKnown _: Bool, percentKnown _: Bool) -> Bool { true }
 }
