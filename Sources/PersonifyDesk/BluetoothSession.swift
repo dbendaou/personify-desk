@@ -307,16 +307,26 @@ final class BluetoothSession: NSObject {
     }
 
     fileprivate func ingest(peripheral: CBPeripheral, advertisementData: [String: Any], rssi: Int) {
-        peripherals[peripheral.identifier] = peripheral
         let connectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? true
         let advertisement = Self.advertisement(from: advertisementData, fallbackName: peripheral.name)
+        let shown = PersonifyVendor.isPersonifyAdvertisement(
+            serviceUUIDs: advertisement.serviceUUIDs,
+            companyIDs: advertisement.manufacturerRecords.map(\.companyID)
+        )
+        guard shown else { return }
+        peripherals[peripheral.identifier] = peripheral
+        let contentChanged = model?.advertisementContentChanged(
+            id: peripheral.identifier,
+            peripheralName: peripheral.name,
+            advertisement: advertisement
+        ) ?? true
         model?.upsert(
             id: peripheral.identifier,
             peripheralName: peripheral.name,
             advertisement: advertisement,
             rssi: rssi,
             connectable: connectable,
-            rawFields: Self.jsonFields(advertisementData)
+            rawFields: contentChanged ? Self.jsonFields(advertisementData) : [:]
         )
     }
 

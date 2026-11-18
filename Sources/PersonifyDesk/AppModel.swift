@@ -18,7 +18,19 @@ final class AppModel {
     var deferredSpacing = 0
     var phase: BluetoothPhase = .starting
     var scanning = false
-    var devices: [UUID: DiscoveredDevice] = [:]
+    /// Latest advertisement for each Personify room. Not observed: every packet
+    /// updates it, and the sidebar reads `roomsInRange` instead.
+    @ObservationIgnored var devices: [UUID: DiscoveredDevice] = [:]
+    /// Rooms heard in the last 45 seconds, strongest signal first. Replaced only
+    /// when the catalog publishes.
+    private(set) var roomsInRange: [DiscoveredDevice] = []
+    @ObservationIgnored private var catalog = RoomCatalog()
+    @ObservationIgnored private var explorerLog = ExplorerLog(directory: ExplorerLog.defaultDirectory())
+    @ObservationIgnored private var presenceTimer: Timer?
+    /// In-range ids. The open room watches this, not the signal-sorted list.
+    private var rangedIDs: Set<UUID> = []
+    private var roomNames: [UUID: String] = [:]
+    private var linkStates: [UUID: LinkState] = [:]
     var selectedDeviceID: UUID?
     var services: [GATTServiceNode] = []
     var selectedCharacteristicID: String?
@@ -97,18 +109,10 @@ final class AppModel {
             session.start()
         }
         startLiveTimer()
+        startPresenceTimer()
     }
 
-    var sortedDevices: [DiscoveredDevice] {
-        devices.values.sorted { lhs, rhs in
-            if lhs.rssi != rhs.rssi { return lhs.rssi > rhs.rssi }
-            return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
-        }
-    }
-
-    var visibleDevices: [DiscoveredDevice] {
-        sortedDevices.filter(isShown)
-    }
+    var visibleDevices: [DiscoveredDevice] { roomsInRange }
 
     func isShown(_ device: DiscoveredDevice) -> Bool {
         PersonifyVendor.isPersonifyAdvertisement(
@@ -150,7 +154,7 @@ final class AppModel {
             return discovered ? .ready : .findingControls
         }
         if connectingDeviceID == id { return .connecting }
-        if case .failed(let message) = devices[id]?.link { return .failed(message) }
+        if case .failed(let message) = linkStates[id] { return .failed(message) }
         return .notConnected
     }
 
@@ -167,7 +171,7 @@ final class AppModel {
     }
 
     func deviceName(_ id: UUID) -> String {
-        devices[id]?.displayName ?? "Room device"
+        roomNames[id] ?? devices[id]?.displayName ?? "Room device"
     }
 
     func toggleScan() {
@@ -341,6 +345,11 @@ final class AppModel {
         log(kind: "state", message: statusLine)
     }
 
+    func advertisementContentChanged(id: UUID, peripheralName: String?, advertisement: Advertisement) -> Bool {
+        guard let existing = devices[id] else { return true }
+        return existing.peripheralName != peripheralName || existing.advertisement != advertisement
+    }
+
     func upsert(
         id: UUID,
         peripheralName: String?,
@@ -360,18 +369,19 @@ final class AppModel {
             lastRSSIEvent: nil,
             link: .idle
         )
-        let contentChanged = device.advertisement != advertisement || devices[id] == nil
+        let isNew = devices[id] == nil
+        let contentChanged = isNew || device.advertisement != advertisement || device.peripheralName != peripheralName
         device.peripheralName = peripheralName
         device.advertisement = advertisement
         device.rssi = rssi
         device.connectable = connectable
         device.lastSeen = now
-        let shown = isShown(device)
+        guard isShown(device) else { return }
         var loggedKind: String?
-        if shown && contentChanged {
+        if contentChanged {
             loggedKind = "advertisement"
             device.lastRSSIEvent = now
-        } else if shown && (device.lastRSSIEvent == nil || now.timeIntervalSince(device.lastRSSIEvent ?? now) > 10) {
+        } else if device.lastRSSIEvent == nil || now.timeIntervalSince(device.lastRSSIEvent ?? now) > 10 {
             loggedKind = "rssi"
             device.lastRSSIEvent = now
         }
@@ -386,14 +396,21 @@ final class AppModel {
         } else if loggedKind == "rssi" {
             log(kind: "rssi", deviceID: id.uuidString, message: "\(device.displayName) \(rssi) dBm", data: ["rssi": .int(rssi)])
         }
-        considerAutoConnect()
+        let change = catalog.note(
+            id: id,
+            name: device.displayName,
+            rssi: rssi,
+            contentChanged: contentChanged,
+            now: now
+        )
+        publishCatalog(change, autoConnect: change == .presence)
     }
 
     func markConnecting(_ id: UUID) {
         connectingDeviceID = id
         connectedDeviceID = nil
         services = []
-        devices[id]?.link = .connecting
+        setLink(id, .connecting)
         selectedDeviceID = id
         resetControls(for: id)
         clearRoomError()
@@ -403,7 +420,7 @@ final class AppModel {
     func markConnected(_ id: UUID) {
         connectingDeviceID = nil
         connectedDeviceID = id
-        devices[id]?.link = .connected
+        setLink(id, .connected)
         clearRoomError()
         blindWatchGeneration += 1
         blindWatch = .idle
@@ -467,7 +484,7 @@ final class AppModel {
 
     func markFailed(_ id: UUID, message: String, authentication: Bool = false) {
         connectingDeviceID = nil
-        devices[id]?.link = .failed(message)
+        setLink(id, .failed(message))
         staleRoomError = message
         deferredFrames = []
         deferredSpacing = 0
@@ -486,7 +503,7 @@ final class AppModel {
         if connectingDeviceID == id { connectingDeviceID = nil }
         services = []
         let text = message ?? "Disconnected."
-        devices[id]?.link = .idle
+        setLink(id, .idle)
         resetControls(for: id)
         statusLine = text
         log(kind: "disconnect", deviceID: id.uuidString, message: text)
@@ -500,7 +517,9 @@ final class AppModel {
         }
     }
 
-    func log(kind _: String, deviceID _: String? = nil, message _: String, data _: [String: JSONValue] = [:]) {}
+    func log(kind: String, deviceID: String? = nil, message: String, data: [String: JSONValue] = [:]) {
+        explorerLog.record(kind: kind, deviceID: deviceID, message: message, data: data)
+    }
 
     func notePairing(_ message: String) {
         statusLine = message
@@ -831,7 +850,7 @@ final class AppModel {
         selectedDeviceID = id
         if demoMode {
             connectedDeviceID = id
-            devices[id]?.link = .connected
+            setLink(id, .connected)
             return
         }
         if connectedDeviceID == id || connectingDeviceID == id { return }
@@ -843,12 +862,12 @@ final class AppModel {
 
     func considerAutoConnect() {
         guard phase == .ready, !showingConnectSheet else { return }
-        let visible = roomsInRange.map(\.id.uuidString)
+        let visible = rangedIDs.map(\.uuidString)
         guard let chosen = roomList.launchTarget(visibleIDs: visible), let id = UUID(uuidString: chosen) else { return }
         if declinedPINPromptFor == id { return }
         if openedRoomID != nil, openedRoomID != id { return }
         if connectedDeviceID == id || connectingDeviceID == id {
-            openedRoomID = id
+            if openedRoomID != id { openedRoomID = id }
             return
         }
         if connectedDeviceID != nil || connectingDeviceID != nil { return }
@@ -907,14 +926,10 @@ final class AppModel {
         }
     }
 
-    /// Advertisements older than this are treated as out of range.
-    var roomsInRange: [DiscoveredDevice] {
-        let now = Date()
-        return visibleDevices.filter { now.timeIntervalSince($0.lastSeen) < 45 }
-    }
+    var rangeIsEmpty: Bool { rangedIDs.isEmpty }
 
     func roomIsInRange(_ id: UUID) -> Bool {
-        roomsInRange.contains { $0.id == id }
+        rangedIDs.contains(id)
     }
 
     private var roomsInRangeListed: [RoomList.VisibleRoom] {
@@ -936,7 +951,7 @@ final class AppModel {
     }
 
     func isFavorite(_ id: UUID) -> Bool {
-        guard let name = devices[id]?.displayName else { return false }
+        guard let name = roomNames[id] ?? devices[id]?.displayName else { return false }
         return roomList.isFavorite(name: name)
     }
 
@@ -1173,7 +1188,12 @@ final class AppModel {
         openedRoomID = atlas
         selectedDeviceID = atlas
         connectedDeviceID = atlas
-        devices[atlas]?.link = .connected
+        setLink(atlas, .connected)
+        let now = Date()
+        for (id, device) in devices {
+            catalog.note(id: id, name: device.displayName, rssi: device.rssi, contentChanged: true, now: now)
+        }
+        publishCatalog(.presence, autoConnect: false)
         phase = .ready
         statusLine = "Demo rooms. Bluetooth is not running."
     }
@@ -1192,6 +1212,55 @@ final class AppModel {
         if let data = try? JSONEncoder().encode(roomList) {
             UserDefaults.standard.set(data, forKey: Keys.roomList)
         }
+    }
+
+    private func setLink(_ id: UUID, _ state: LinkState) {
+        if var device = devices[id] {
+            device.link = state
+            devices[id] = device
+        }
+        switch state {
+        case .idle:
+            if linkStates[id] != nil { linkStates[id] = nil }
+        default:
+            if linkStates[id] != state { linkStates[id] = state }
+        }
+    }
+
+    private func publishCatalog(_ change: RoomCatalog.Change, autoConnect: Bool) {
+        guard change != .none else { return }
+        var next: [DiscoveredDevice] = []
+        next.reserveCapacity(catalog.sorted.count)
+        for sighting in catalog.sorted {
+            guard var device = devices[sighting.id] else { continue }
+            device.rssi = sighting.rssi
+            device.lastSeen = sighting.lastSeen
+            let name = device.displayName
+            if roomNames[sighting.id] != name {
+                roomNames[sighting.id] = name
+            }
+            next.append(device)
+        }
+        roomsInRange = next
+        guard change == .presence else { return }
+        let ids = Set(next.map(\.id))
+        if rangedIDs != ids { rangedIDs = ids }
+        if autoConnect { considerAutoConnect() }
+    }
+
+    private func flushRoomCatalog() {
+        let change = catalog.flush(now: Date())
+        publishCatalog(change, autoConnect: change == .presence)
+    }
+
+    private func startPresenceTimer() {
+        let timer = Timer(timeInterval: RoomCatalog.flushInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.flushRoomCatalog()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        presenceTimer = timer
     }
 
     private func startLiveTimer() {

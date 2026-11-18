@@ -3,27 +3,28 @@ import PersonifyCore
 import SwiftUI
 
 struct HomeScreen: View {
-    @Environment(AppModel.self) private var model
-
     var body: some View {
         NavigationSplitView {
-            sidebar
+            RoomSidebarColumn()
         } detail: {
-            detail
+            RoomDetailColumn()
         }
         .navigationSplitViewStyle(.balanced)
     }
+}
 
-    private var favoriteDevices: [DiscoveredDevice] { model.favoriteDevices }
+/// Sidebar only. It reads the cached room list, so a signal refresh does not
+/// rebuild the open room.
+private struct RoomSidebarColumn: View {
+    @Environment(AppModel.self) private var model
 
-    private var recentDevices: [DiscoveredDevice] { model.recentDevices }
-
-    private var nearbyDevices: [DiscoveredDevice] {
-        let used = Set(favoriteDevices.map(\.id) + recentDevices.map(\.id))
-        return model.roomsInRange.filter { !used.contains($0.id) }
-    }
-
-    private var sidebar: some View {
+    var body: some View {
+        let rooms = model.roomsInRange
+        let listed = rooms.map { RoomList.VisibleRoom(id: $0.id.uuidString, name: $0.displayName) }
+        let sections = model.roomList.sidebar(visible: listed)
+        let favorites = devices(in: rooms, ids: sections.favorites)
+        let recent = devices(in: rooms, ids: sections.recent)
+        let nearby = devices(in: rooms, ids: sections.nearby)
         List(selection: Binding(
             get: { model.openedRoomID },
             set: { id in
@@ -32,28 +33,28 @@ struct HomeScreen: View {
             }
         )) {
             Section("Favorites") {
-                if favoriteDevices.isEmpty {
+                if favorites.isEmpty {
                     Text("Star a room to keep it here")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
-                ForEach(favoriteDevices) { device in
+                ForEach(favorites) { device in
                     roomRow(device)
                 }
             }
-            if !recentDevices.isEmpty {
+            if !recent.isEmpty {
                 Section("Recent") {
-                    ForEach(recentDevices) { device in
+                    ForEach(recent) { device in
                         roomRow(device)
                     }
                 }
             }
             Section("Nearby") {
-                if model.roomsInRange.isEmpty {
+                if rooms.isEmpty {
                     Text("No rooms in range")
                         .foregroundStyle(.secondary)
                 }
-                ForEach(nearbyDevices) { device in
+                ForEach(nearby) { device in
                     roomRow(device)
                 }
             }
@@ -71,6 +72,11 @@ struct HomeScreen: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
         }
+    }
+
+    private func devices(in rooms: [DiscoveredDevice], ids: [String]) -> [DiscoveredDevice] {
+        let byID = Dictionary(uniqueKeysWithValues: rooms.map { ($0.id.uuidString, $0) })
+        return ids.compactMap { byID[$0] }
     }
 
     private func roomRow(_ device: DiscoveredDevice) -> some View {
@@ -122,8 +128,14 @@ struct HomeScreen: View {
         }
     }
 
-    @ViewBuilder
-    private var detail: some View {
+}
+
+/// Detail only. Presence comes from the in-range ids, so an RSSI refresh of
+/// the sidebar does not rebuild the dashboard.
+private struct RoomDetailColumn: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
         if let id = model.openedRoomID, model.roomIsInRange(id) {
             RoomDashboard(roomID: id)
         } else {
@@ -136,7 +148,7 @@ struct HomeScreen: View {
     }
 
     private var emptyDetail: String {
-        if model.roomsInRange.isEmpty {
+        if model.rangeIsEmpty {
             return "No rooms are in range."
         }
         if let name = model.roomList.lastSelectedName {
